@@ -18,11 +18,15 @@ void XenonEthernet::handleInterrupt(IOInterruptEventSource *intEventSource, int 
     phyUpdateLinkStatus();
   }
 
-  if (intStatus & kXenonEthernetIntRxDone) {
+  // Handle RxHalt/TxHalt together with the done bits. The engine raises Halt and stops
+  // whenever its internal cursor catches up to a descriptor the driver has not re-armed
+  // yet (e.g. a receive burst briefly outran this handler). We must drain the ring AND
+  // re-poll the engine to restart it; otherwise it stays halted and all traffic stops.
+  if (intStatus & (kXenonEthernetIntRxDone | kXenonEthernetIntRxHalt)) {
     handleRxInterrupt();
   }
 
-  if (intStatus & kXenonEthernetIntTxDone) {
+  if (intStatus & (kXenonEthernetIntTxDone | kXenonEthernetIntTxHalt)) {
     handleTxInterrupt();
   }
 }

@@ -80,6 +80,9 @@ private:
   IOEthernetInterface     *_ethInterface;
   IOInterruptEventSource  *_intEventSource;
 
+  // BSD interface statistics (netstat -ni). Populated as packets are received/sent.
+  IONetworkStats          *_netStats;
+
   // Transmit descriptors.
   XenonEthernetDescriptor     *_txDesc;
   IOBufferMemoryDescriptor    *_txDescBufferDesc;

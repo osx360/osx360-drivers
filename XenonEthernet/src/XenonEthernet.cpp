@@ -81,6 +81,13 @@ bool XenonEthernet::start(IOService *provider) {
     XESYSLOG("Failed to attach interface");
     return false;
   }
+
+  // Grab the BSD statistics buffer so netstat -ni reflects real traffic.
+  IONetworkData *statsData = _ethInterface->getNetworkData(kIONetworkStatsKey);
+  if (statsData != NULL) {
+    _netStats = (IONetworkStats *) statsData->getBuffer();
+  }
+
   _ethInterface->registerService();
 
   XEDBGLOG("Started Xenon Ethernet controller");

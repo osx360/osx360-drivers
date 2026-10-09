@@ -180,7 +180,9 @@ IONetworkMedium* XenonEthernet::phyGetActiveMedium(void) {
   UInt16 anlp;
 
   // Get the common autonegotiation bits between the controller and the partner.
-  if (!phyRead(kXenonEthernetPhyRegAnar, &anar) || !phyRead(kXenonEthernetPhyRegAnar, &anlp)) {
+  // The second read must be the link-partner ability register (ANLP), not ANAR again,
+  // or duplex is resolved against our own advertisement and can mismatch the partner.
+  if (!phyRead(kXenonEthernetPhyRegAnar, &anar) || !phyRead(kXenonEthernetPhyRegAnlp, &anlp)) {
     return NULL;
   }
 

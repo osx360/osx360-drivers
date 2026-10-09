@@ -178,14 +178,26 @@ UInt32 XenonEthernet::sendTxPacket(mbuf_t packet) {
 
     if (_txWriteIndex < 10) XEDBGLOG("Total packet length 0x%X", packetLength);
 
-  if (_txWriteIndex == (kXenonEthernetTxDescCount - 1)) {
-    desc->length |= OSSwapHostToLittleInt32(kXenonEthernetDescLengthEnd);
-  }
+  // Descriptor (count-1) is the ring's wrap point and must ALWAYS carry the END marker so the
+  // TX engine loops back to descriptor 0. Writing a packet into that slot above cleared it (its
+  // length was overwritten), so re-apply it here. Doing it unconditionally on the fixed last
+  // slot is correct and idempotent: END is a permanent property of that ring position,
+  // independent of packet boundaries (which use the LastSeg flag), so re-setting an already-set
+  // bit never corrupts an in-flight descriptor. The old code checked the wrong index and ORed
+  // into an uninitialized `desc` on single-segment packets, so the marker was lost after one
+  // lap and the TX engine silently halted (flatlined Opkts). This is the transmit analogue of
+  // the RX END-marker fix.
+  _txDesc[kXenonEthernetTxDescCount - 1].length |= OSSwapHostToLittleInt32(kXenonEthernetDescLengthEnd);
   _txWriteIndex = TX_NEXT(index);
 
-  // Hand off ownership and signal the hardware of the new packet.
+  // Hand off ownership and signal the hardware of the new packet. The barrier ensures every
+  // descriptor field written above (addresses, lengths, and the OWNER bits on the trailing
+  // segments) is visible before the first descriptor's OWNER bit releases the chain to the
+  // weakly-ordered DMA engine.
   descStart->flags  = OSSwapHostToLittleInt32(flags);
+  OSSynchronizeIO();
   descStart->flags |= OSSwapHostToLittleInt32(kXenonEthernetTxFlagsOwner | kXenonEthernetTxFlagsInterrupt);
+  OSSynchronizeIO();
   writeReg32(kXenonEthernetRegTxControl, readReg32(kXenonEthernetRegTxControl) | kXenonEthernetRegTxControlPoll);
 
   return kIOReturnOutputSuccess;
@@ -213,6 +225,9 @@ if (_txWriteIndex < 10)
     if (_txDescStates[_txReadIndex].packet != NULL) {
       freePacket(_txDescStates[_txReadIndex].packet);
       _txDescStates[_txReadIndex].packet = NULL;
+      if (_netStats != NULL) {
+        _netStats->outputPackets++;
+      }
     }
 
     // Clear out the descriptors.
@@ -224,6 +239,12 @@ if (_txWriteIndex < 10)
     }
   }
 
+  // If descriptors are still outstanding, re-poll in case the engine halted (TxHalt)
+  // after catching up to unsent work rather than simply going idle.
+  if (_txReadIndex != _txWriteIndex) {
+    writeReg32(kXenonEthernetRegTxControl, readReg32(kXenonEthernetRegTxControl) | kXenonEthernetRegTxControlPoll);
+  }
+
   _txQueue->service(IOBasicOutputQueue::kServiceAsync);
 }
 
@@ -233,44 +254,70 @@ if (_txWriteIndex < 10)
 void XenonEthernet::handleRxInterrupt(void) {
   XenonEthernetDescriptor *desc;
   UInt16  packetLength;
-  mbuf_t  packet;
-  mbuf_t  packetReceived;
-  bool    replaced;
+  mbuf_t  copy;
+  UInt32  processed = 0;
 
   while (true) {
-    // Process any descriptors up until the first untouched one.
+    // Process any descriptors up until the first still owned by the hardware.
     desc = &_rxDesc[_rxIndex];
-    if (desc->flags & OSSwapHostToLittleInt32(kXenonEthernetTxFlagsOwner)) {
+    if (desc->flags & OSSwapHostToLittleInt32(kXenonEthernetRxFlagsOwner)) {
       break;
     }
 
-    // XEDBGLOG("Received packet %u stat 0x%X flags 0x%X length 0x%X", _rxIndex,
-    //   OSSwapLittleToHostInt32(desc->status), OSSwapLittleToHostInt32(desc->flags), OSSwapLittleToHostInt32(desc->length));
+    // Bound the work per invocation to at most one full ring so a pathological descriptor
+    // state can never spin the CPU forever; the trailing re-poll and the next interrupt pick
+    // up anything left over.
+    if (processed >= kXenonEthernetRxDescCount) {
+      break;
+    }
+    processed++;
 
-    packet = _rxPackets[_rxIndex];
     packetLength = OSSwapLittleToHostInt32(desc->packetLength) & kXenonEthernetRxLengthMask;
-    packetReceived = replaceOrCopyPacket(&packet, packetLength, &replaced);
-    if (packetReceived == NULL) {
-      XESYSLOG("Failed to get the packet?");
+
+    // Copy-only receive. The ring buffer for this slot is allocated once at init and NEVER
+    // handed to the stack, freed, or moved -- so its DMA address is permanently valid and we
+    // never reprogram a descriptor address at runtime. This makes the "device DMAs into a
+    // buffer the stack now owns" corruption impossible. We copy the received bytes into a
+    // fresh mbuf for the stack and leave the ring buffer in place.
+    //
+    // Length is validated first: a bogus length (errored/oversized frame, torn status read
+    // under load) would make copyPacket read past the buffer.
+    if ((packetLength > 0) && (packetLength <= kIOEthernetMaxPacketSize)) {
+      copy = copyPacket(_rxPackets[_rxIndex], packetLength);
+      if (copy != NULL) {
+        _ethInterface->inputPacket(copy, packetLength, IONetworkInterface::kInputOptionQueuePacket);
+        if (_netStats != NULL) {
+          _netStats->inputPackets++;
+        }
+      } else if (_netStats != NULL) {
+        _netStats->inputErrors++;
+      }
+    } else if (_netStats != NULL) {
+      _netStats->inputErrors++;
     }
 
-    if (replaced) {
-      _rxPackets[_rxIndex] = packet;
-    }
-
-    if (!setRxDescriptorPacket(desc, packet)) {
-      freePacket(packet);
-      packetReceived = NULL;
-      XESYSLOG("Failed to set the packet?");
-    }
+    // Re-arm the descriptor FULLY every pass. The hardware clears the buffer length / END
+    // marker (offset 12) when it writes back a completed descriptor, so if we only rewrote the
+    // ownership word the ring would lose its wrap point after one full lap (256 packets) and
+    // the RX engine would silently halt. Copy-only means the buffer never moves, so
+    // setRxDescriptorPacket just restores the same address+length; we then re-apply the END
+    // marker on the last slot. The barrier before releasing OWNER keeps the weakly-ordered CPU
+    // from exposing the owner bit ahead of these descriptor writes (and the copy above).
+    setRxDescriptorPacket(desc, _rxPackets[_rxIndex]);
     if (_rxIndex == (kXenonEthernetRxDescCount - 1)) {
       desc->length |= OSSwapHostToLittleInt32(kXenonEthernetDescLengthEnd);
     }
-    desc->flags = OSSwapHostToLittleInt32(kXenonEthernetTxFlagsInterrupt | kXenonEthernetTxFlagsOwner);
+    OSSynchronizeIO();
+    desc->flags = OSSwapHostToLittleInt32(kXenonEthernetRxFlagsInterrupt | kXenonEthernetRxFlagsOwner);
+    OSSynchronizeIO();
 
-    _ethInterface->inputPacket(packetReceived, packetLength, IONetworkInterface::kInputOptionQueuePacket);
     _rxIndex = RX_NEXT(_rxIndex);
   }
+
+  // Restart the receive engine. If it halted after exhausting driver-owned descriptors,
+  // the poll bit tells it to re-scan from RxNext (now re-armed above) and resume DMA.
+  // Without this a single halt permanently kills receive.
+  writeReg32(kXenonEthernetRegRxControl, readReg32(kXenonEthernetRegRxControl) | kXenonEthernetRegRxControlPoll);
 
   _ethInterface->flushInputQueue();
 }
