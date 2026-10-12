@@ -27,7 +27,7 @@
 			<key>IOMatchCategory</key>
 			<string>XenosController</string>
 			<key>IOPCIMatch</key>
-			<string>0x58411414</string>
+			<string>0x58411414 0x58211414</string>
 			<key>IOProbeScore</key>
 			<integer>1000</integer>
 			<key>IOProviderClass</key>
