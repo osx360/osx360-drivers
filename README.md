@@ -22,7 +22,7 @@ AltiVec is not supported on Xenon in favor of VMX128 which drops some AltiVec in
 * The latest release of [OpenBIOS Xbox 360 fork](https://github.com/osx360/openbios).
 * The latest release of the drivers mkext from the Releases tab.
 * Mac OS X Tiger 10.4.6 DVD (the CD version may also work, but is currently untested)
-  * A USB installer can also work, but will require partitioning that is currently not documented here.
+  * A USB installer can also work, but will require partitioning that is currently [documented here](docs/USBPartitioning.md).
   * Certain DVD drives require a tray cycle before working. So far this needs to be done on the DL10N, but others may be affected.
 * Hard drive to install Mac OS X to. This will be destructive, do not use a stock Xbox 360 hard drive.
   * Any drive should work, but there are some issues with some WD drives and OpenBIOS currently.
